@@ -10,7 +10,9 @@ l 1 2 3 ... 100    <- then one line per stroke, 1-based vertex indices
 ...
 ```
 
-The two folders sit side by side. vrscaffolding is used as-is and never changed:
+**This repo needs a copy of vrscaffolding next to it.** You never run anything from vrscaffolding, but the server
+loads the VR page's libraries (three.js, controller models, fonts, CSS) and the line-fitting code from it, and won't
+start without it. The two folders sit side by side, and vrscaffolding is used as-is and never changed:
 
 ```
 other/
@@ -23,6 +25,22 @@ other/
 ## Step by step
 
 ### 1. One-time setup (computer)
+
+Get both repos into the same parent folder (the commands below assume `~/workspace/other`; adjust the paths if
+yours is elsewhere):
+
+```bash
+cd ~/workspace/other && git clone https://github.com/yig/vrscaffolding
+```
+
+```bash
+cd ~/workspace/other && git clone https://github.com/maepigeon/vr-sketch-saver
+```
+
+If vrscaffolding lives somewhere else, start the server with
+`--vrscaffolding /path/to/vrscaffolding/threejs` instead.
+
+Then install the Python packages and `adb`:
 
 ```bash
 pip3 install "numpy<2" scipy websockets
