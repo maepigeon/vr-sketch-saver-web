@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<title>Drawing with Scaffolds</title>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+		<link type="text/css" rel="stylesheet" href="main.css">
+		<meta http-equiv="Cache-control" content="no-cache">
+	</head>
+	<body>
+
+		<div id="info">
+			Drawing with Scaffolds
+			<div id="duration"></div>
+			<div id="status"></div>
+		</div>
+
+		<script src="./js/HelioWebXRPolyfill.js"></script>
+
+		<script type="module">
+
+			import * as THREE from './js/three.module.js';
+			import { OrbitControls } from './js/OrbitControls.js';
+			import { TubePainter } from './js/TubePainter.js';
+			import { VRButton } from './js/VRButton.js';
+			import { BoxLineGeometry } from './js/BoxLineGeometry.js';
+			import { XRControllerModelFactory } from './js/XRControllerModelFactory.js';
+			import { WebSocketClient } from './js/websocket-client.js';
+			import { ModeManager } from './js/ModeManager.js';
+			import { draw_line, draw_curve, stroke_group_visible } from'./js/DrawUtils.js';
+
+			var container;
+			var camera, scene, renderer;
+
+			var controller1, controller2;
+			var controllerGrip1, controllerGrip2;
+			
+			var scaffold_strokes, shape_strokes;
+			
+			var room;
+
+			// try pass cursor data to backend
+			var cursor = new THREE.Vector3();
+
+			var controls;
+			
+			var socket;
+			var avg_duration;
+			var last_durations = [];
+			var last_durations_index = 0;
+
+			let descriptive_mode_indicator;
+			let undo_text_mesh;
+			let save_text_mesh;
+			let status_text_mesh;
+			let status_text_timeout;
+			let font;
+			let left_controller;
+
+			// Everything drawn, newest last, for undo.
+			// Each entry is a list of [ group, object ] pairs.
+			let drawn_stack = [];
+
+			// Freehand: strokes stay exactly as drawn.
+			// paint.html?mode=scaffold: vrscaffolding's line and curve fitting.
+			const freehand = new URL( window.location.href ).searchParams.get( "mode" ) !== "scaffold";
+			let freehand_strokes;
+
+			var draw_descriptive_mode = false;
+
+			// show and hide scaffold lines
+			var show_scaffold = true; 
+
+			init();
+			initWebSocket();
+			animate();
+			
+			function init() {
+
+
+
+				container = document.createElement( 'div' );
+				document.body.appendChild( container );
+
+				scene = new THREE.Scene();
+				scene.background = new THREE.Color( 0x222222 );
+
+				camera = new THREE.PerspectiveCamera( 50, window.innerWidth / window.innerHeight, 0.01, 50 );
+				camera.position.set( 0, 1.6, 3 );
+
+				controls = new OrbitControls( camera, container );
+				controls.target.set( 0, 1.6, 0 );
+				controls.update();
+
+				room = new THREE.LineSegments(
+					new BoxLineGeometry( 6, 6, 6, 10, 10, 10 ),
+					new THREE.LineBasicMaterial( { color: 0x505050 } )
+				);
+				room.geometry.translate( 0, 3, 0 );
+				scene.add( room );
+
+				// https://threejs.org/docs/#api/en/helpers/AxesHelper
+				var axesHelper = new THREE.AxesHelper( 1 );
+				scene.add( axesHelper );
+
+				scene.add( new THREE.HemisphereLight( 0x888877, 0x777788 ) );
+
+				var light = new THREE.DirectionalLight( 0xffffff, 0.5 );
+				light.position.set( 0, 4, 0 );
+				scene.add( light );
+
+				var painter1 = new TubePainter();
+				// painter1.setColor( 0xe0e0ff );
+				scene.add( painter1.mesh );
+
+				var painter2 = new TubePainter();
+				// painter2.setColor( 0xffe0ff );
+				scene.add( painter2.mesh );
+				
+				
+				// Make groups for the user's input
+				scaffold_strokes = new THREE.Group();
+				shape_strokes = new THREE.Group();
+				scene.add( scaffold_strokes );
+				scene.add( shape_strokes );
+				freehand_strokes = new THREE.Group();
+				scene.add( freehand_strokes );
+
+				// renderer
+				renderer = new THREE.WebGLRenderer( { antialias: true } );
+				renderer.setPixelRatio( window.devicePixelRatio );
+				renderer.setSize( window.innerWidth, window.innerHeight );
+				renderer.outputEncoding = THREE.sRGBEncoding;
+				renderer.xr.enabled = true;
+				container.appendChild( renderer.domElement );
+				document.body.appendChild( VRButton.createButton( renderer ) );
+
+				// controllers
+				function onSelectStart() {
+					this.userData.isSelecting = true;
+
+					// Tell the userData that we've finished.
+					if( this.userData.selectStart !== undefined ) this.userData.selectStart();
+				}
+
+				function onSelectEnd() {
+					this.userData.isSelecting = false;
+
+					// Tell the userData that we've finished.
+					if( this.userData.selectEnd !== undefined ) this.userData.selectEnd();
+				}
+
+
+				function onSqueezeStart() {
+
+					// The left grip is the undo button, so it doesn't resize the brush.
+					if ( this.userData.XRInputSource && this.userData.XRInputSource.handedness === "left" ) return;
+
+					this.userData.isSqueezing = true;
+					this.userData.positionAtSqueezeStart = this.position.y;
+					this.userData.scaleAtSqueezeStart = this.scale.x;
+
+				}
+
+				function onSqueezeEnd() {
+
+					this.userData.isSqueezing = false;
+
+				}
+
+				function startStroke() {
+					let userData = this;
+					userData.active_stroke = [];
+				}
+				function submitStroke() {
+					let userData = this;
+					if ( freehand ) {
+						add_freehand_stroke( userData );
+					} else if ( draw_descriptive_mode == true ) {
+						socket.send( "shape-stroke " + JSON.stringify( userData.active_stroke) );
+					} else {
+						socket.send( "construction-stroke " + JSON.stringify( userData.active_stroke ) );
+					}
+				}
+
+				controller1 = renderer.xr.getController( 0 );
+				controller1.addEventListener( 'selectstart', onSelectStart );
+				controller1.addEventListener( 'selectend', onSelectEnd );
+				controller1.addEventListener( 'squeezestart', onSqueezeStart );
+				controller1.addEventListener( 'squeezeend', onSqueezeEnd );
+				
+				controller1.userData.painter = painter1;
+				controller1.userData.active_stroke = [];
+				controller1.userData.selectStart = startStroke;
+				controller1.userData.selectEnd = submitStroke;
+				scene.add( controller1 );
+
+				controller2 = renderer.xr.getController( 1 );
+				controller2.addEventListener( 'selectstart', onSelectStart );
+				controller2.addEventListener( 'selectend', onSelectEnd );
+				controller2.addEventListener( 'squeezestart', onSqueezeStart );
+				controller2.addEventListener( 'squeezeend', onSqueezeEnd );
+
+				controller2.userData.painter = painter2;
+				controller2.userData.selectStart = startStroke;
+				controller2.userData.selectEnd = submitStroke;
+				scene.add( controller2 );
+
+
+				controller2.addEventListener( 'connected', function( event ) {
+					controller2.userData.XRInputSource = event.data;
+
+					// maybe I can also attach the buttons here
+					console.log( 'controller2', controller2.userData.XRInputSource );
+				});
+
+				controller1.addEventListener( 'connected', function( event ) {
+					controller1.userData.XRInputSource = event.data;
+					console.log( 'controller1', controller1.userData.XRInputSource );
+				});
+
+				
+				// Add the pawn geometry for each controller.
+				// This is used in handleController() to set the cursor position.
+				var geometry = new THREE.CylinderBufferGeometry( 0.01, 0.02, 0.07, 5 );
+				geometry.rotateX( - Math.PI / 2 );
+				var material = new THREE.MeshStandardMaterial( { flatShading: true } );
+				var mesh = new THREE.Mesh( geometry, material );
+				mesh.position.z = -0.02;
+
+				var pivot = new THREE.Mesh( new THREE.IcosahedronBufferGeometry( 0.01, 2 ) );
+				pivot.name = 'pivot';
+				pivot.position.z = - 0.04;
+				mesh.add( pivot );
+
+				controller1.add( mesh.clone() );
+				controller2.add( mesh.clone() );
+				controller1.userData.pivot = controller1.getObjectByName( 'pivot' );
+				controller2.userData.pivot = controller2.getObjectByName( 'pivot' );
+
+
+				
+				// The XRControllerModelFactory will automatically fetch controller models
+				// that match what the user is holding as closely as possible. The models
+				// should be attached to the object returned from getControllerGrip in
+				// order to match the orientation of the held device.
+
+				var controllerModelFactory = new XRControllerModelFactory();
+
+				controllerGrip1 = renderer.xr.getControllerGrip( 0 );
+				controllerGrip1.add( controllerModelFactory.createControllerModel( controllerGrip1 ) );
+				scene.add( controllerGrip1 );
+
+				controllerGrip2 = renderer.xr.getControllerGrip( 1 );
+				controllerGrip2.add( controllerModelFactory.createControllerModel( controllerGrip2 ) );
+				scene.add( controllerGrip2 );
+
+				// add sphere as descriptive_mode_indicator
+				let sphere_geometry = new THREE.SphereGeometry(0.01, 16, 16);
+				let sphere_material = new THREE.MeshBasicMaterial( {color: 0xff0000} );
+				descriptive_mode_indicator = new THREE.Mesh( sphere_geometry, sphere_material ); 
+				descriptive_mode_indicator.position.x -= 0.03;
+				descriptive_mode_indicator.name = "descriptive_mode_indicator";
+
+
+				var loader = new THREE.FontLoader();
+				loader.load( 'js/fonts/helvetiker_regular.typeface.json', function ( loaded_font ) {
+					font = loaded_font;
+					var geometry = new THREE.TextGeometry( 'undo', {
+						font: font,
+						size: 0.008,
+						height: 0.001,
+					} );
+
+					undo_text_mesh = new THREE.Mesh(geometry);
+					undo_text_mesh.name = 'undo';
+
+					// Floats above the left controller, tilted toward the eyes.
+					save_text_mesh = new THREE.Mesh( new THREE.TextGeometry( 'X: save', {
+						font: font,
+						size: 0.008,
+						height: 0.001,
+					} ) );
+					save_text_mesh.geometry.rotateX( -Math.PI/4 );
+					save_text_mesh.position.set( -0.02, 0.03, 0.02 );
+					save_text_mesh.name = 'save';
+				} );
+
+				// Keyboard shortcuts for trying the page on a computer.
+				window.addEventListener( 'keydown', function( event ) {
+					if ( !( event.ctrlKey || event.metaKey ) ) return;
+					if ( event.key === 'z' ) { event.preventDefault(); undo(); }
+					if ( event.key === 's' ) { event.preventDefault(); save_sketch(); }
+				} );
+
+
+				window.addEventListener( 'resize', onWindowResize, false );
+			}
+
+			async function initWebSocket() {
+                // Let's use WebSocketClient library, which supports await: https://github.com/jcao219/websocket-async
+                // Write a websockets server using: http://websockets.readthedocs.io/en/stable/intro.html
+                socket = new WebSocketClient;
+                
+                // Socket from URL in modern JavaScript: https://stackoverflow.com/questions/979975/how-to-get-the-value-from-the-get-parameters
+                var url = new URL( window.location.href );
+                var port = 9001; // the Quest 3 refuses `adb reverse` on 9000
+                if( url.searchParams.has("port") ) {
+                    port = parseInt( url.searchParams.get("port") );
+                }
+                
+                await socket.connect('ws://localhost:' + port);
+                console.log( "Connected on port " + port + ": ", socket.connected );
+
+             	// The time in seconds since some arbitrary point in time.
+			 	function now() {
+                    return ( new Date().getTime() ) / 1000.;
+                }
+       
+
+
+                // To simulate an .onmessage() callback:
+                // TODO Q: What happens if you call socket.disconnect() and socket.connect() during an await?
+                while( true ) {
+                    const msg = await socket.receive();
+
+					var cmd = msg.substr(0,msg.indexOf(' '));
+					var payload = JSON.parse( msg.substr(msg.indexOf(' ')+1) );
+    
+                    // process the msg
+					if( cmd == "new-straight-line" ) {
+
+						// clear the drawing 
+
+						// get the painter and clear the drawing of painter
+						// do not know whether it is good practice here.						
+						controller1.userData.painter.clear();
+						controller2.userData.painter.clear();
+
+						console.log( payload );
+						
+
+						var res = draw_line( payload );
+
+
+						if ( res !== undefined ) {
+							var construction_line = res[0];
+							var dot = res[1];
+						
+							scaffold_strokes.add( construction_line );
+							scaffold_strokes.add( dot );
+							drawn_stack.push( [ [ scaffold_strokes, construction_line ], [ scaffold_strokes, dot ] ] );
+							renderer.render( scene, camera );
+						} else {
+							// Keep in step with the server's undo list.
+							drawn_stack.push( [] );
+						}
+
+					}
+					else if( cmd == "new-shape-line" ) {
+						
+						// get the painter and clear the drawing of painter
+						// do not know whether it is good practice here.						
+						controller1.userData.painter.clear();
+						controller2.userData.painter.clear();
+
+						var descriptive_line = draw_curve( payload );
+						
+						if ( descriptive_line !== undefined ) {
+							shape_strokes.add( descriptive_line );
+							drawn_stack.push( [ [ shape_strokes, descriptive_line ] ] );
+							renderer.render( scene, camera );
+						} else {
+							drawn_stack.push( [] );
+						}
+
+					}
+					else if( cmd == "undone" ) {
+
+						// Also drops any leftover tube from a stroke the server couldn't fit.
+						controller1.userData.painter.clear();
+						controller2.userData.painter.clear();
+
+						const entry = drawn_stack.pop() || [];
+						for ( const [ group, object ] of entry ) {
+							group.remove( object );
+							object.geometry.dispose();
+							object.material.dispose();
+						}
+						show_status( { shapes: "undid shape curve", scaffold: "undid scaffold line", raw: "undid stroke" }[ payload.layer ] );
+
+					}
+					else if( cmd == "nothing-to-undo" ) {
+						show_status( "nothing to undo" );
+					}
+					else if( cmd == "saved" ) {
+						show_status( "saved " + payload.strokes + " strokes\n" + payload.file, 6 );
+					}
+					else if( cmd == "save-failed" ) {
+						show_status( "not saved:\n" + payload.message, 6 );
+					}
+					else {
+						console.error( "Unknown message:", msg );
+					}
+
+
+					const start = now();
+					// socket.send( JSON.stringify(cursor_active_stroke) );
+                    // socket.send("ping");
+
+			
+                    //const msg = await socket.receive();
+                    const duration = now() - start;
+                    // console.log( "duration:", duration );
+                    avg_duration = avg_duration !== undefined ? .99*avg_duration + 0.01*duration : duration;
+                    // document.getElementById( 'duration' ).innerHTML = 'avg duration: ' + avg_duration.toFixed(4) + ', duration: ' + duration.toFixed(4);
+                    
+                    // Also compute the median.
+                    last_durations[ last_durations_index ] = duration;
+                    last_durations_index = ( last_durations_index + 1 ) % 11;
+                    let last_durations_sorted = last_durations.slice();
+                    last_durations_sorted.sort( (a, b) => a - b );
+                    const median = last_durations_sorted[ Math.floor( last_durations_sorted.length/2 ) ];
+                    document.getElementById( 'duration' ).innerHTML = (
+                        'avg duration: ' + avg_duration.toFixed(4)
+                        +
+                        ', median duration: ' + median.toFixed(4)
+                        +
+                        ', duration: ' + duration.toFixed(4)
+                        );
+
+                }
+                
+                
+   
+            }
+
+			function onWindowResize() {
+
+				camera.aspect = window.innerWidth / window.innerHeight;
+				camera.updateProjectionMatrix();
+
+				renderer.setSize( window.innerWidth, window.innerHeight );
+
+			}
+
+			// Replaces the painter's tube for a finished stroke with a tube of its own,
+			// so that undo can remove it, and sends the stroke to the server.
+			function add_freehand_stroke( userData ) {
+				const points = userData.active_stroke;
+
+				// Same test as the server: a stroke needs two different points.
+				if ( !points.some( p => !p.equals( points[ 0 ] ) ) ) return;
+
+				if ( !( socket && socket.connected ) ) {
+					show_status( "no connection to sketch_server.py:\nthis stroke won't be saved" );
+					return;
+				}
+
+				// Skip repeats from holding the controller still, so the tube stays smooth.
+				const path = points.filter( ( p, i ) => i === 0 || !p.equals( points[ i - 1 ] ) );
+				const curve = new THREE.CatmullRomCurve3( path, false, "centripetal" );
+				// The painter's tube radius is 0.01 * its size, which follows the pivot's scale.
+				const geometry = new THREE.TubeBufferGeometry( curve, Math.max( 2, path.length * 2 ), 0.01 * userData.pivot.scale.x, 10, false );
+				const tube = new THREE.Mesh( geometry, new THREE.MeshStandardMaterial( { color: 0xffffff } ) );
+
+				freehand_strokes.add( tube );
+				drawn_stack.push( [ [ freehand_strokes, tube ] ] );
+				userData.painter.clear();
+
+				socket.send( "freehand-stroke " + JSON.stringify( points ) );
+			}
+
+			function undo() {
+				if ( socket && socket.connected ) socket.send( "undo" );
+			}
+
+			function save_sketch() {
+				if ( socket && socket.connected ) {
+					socket.send( "save-sketch" );
+				} else {
+					show_status( "not saved:\nno connection to sketch_server.py" );
+				}
+			}
+
+			// Wraps text into lines of at most `width` characters.
+			function wrap( text, width ) {
+				return text.split( "\n" ).map( function( paragraph ) {
+					let lines = [ "" ];
+					for ( const word of paragraph.split( " " ) ) {
+						const last = lines[ lines.length - 1 ];
+						if ( last.length > 0 && last.length + 1 + word.length > width ) lines.push( word );
+						else lines[ lines.length - 1 ] = last.length > 0 ? last + " " + word : word;
+					}
+					return lines.join( "\n" );
+				} ).join( "\n" );
+			}
+
+			// Shows a short message above the left controller (and on the page) for a few seconds.
+			function show_status( text, seconds = 3 ) {
+				document.getElementById( 'status' ).textContent = text.replace( /\n/g, ' ' );
+				clear_status_mesh();
+				clearTimeout( status_text_timeout );
+
+				if ( font !== undefined && left_controller !== undefined ) {
+					const geometry = new THREE.TextGeometry( wrap( text, 28 ), { font: font, size: 0.007, height: 0.001 } );
+					geometry.rotateX( -Math.PI/4 );
+					status_text_mesh = new THREE.Mesh( geometry, new THREE.MeshBasicMaterial( { color: 0xffff88 } ) );
+					status_text_mesh.position.set( -0.02, 0.06, 0.0 );
+					left_controller.add( status_text_mesh );
+				}
+
+				status_text_timeout = setTimeout( function() {
+					document.getElementById( 'status' ).textContent = '';
+					clear_status_mesh();
+				}, seconds * 1000 );
+			}
+
+			function clear_status_mesh() {
+				if ( status_text_mesh === undefined ) return;
+				if ( status_text_mesh.parent ) status_text_mesh.parent.remove( status_text_mesh );
+				status_text_mesh.geometry.dispose();
+				status_text_mesh.material.dispose();
+				status_text_mesh = undefined;
+			}
+
+			function clone_gamepad( gamepad ) {
+                // There are a few ways to clone an object or array in javascript.
+                // From: https://stackoverflow.com/questions/122102/what-is-the-most-efficient-way-to-deep-clone-an-object-in-javascript
+                // From: https://stackoverflow.com/questions/3978492/fastest-way-to-duplicate-an-array-in-javascript-slice-vs-for-loop
+
+                // The simplest way:
+                // return JSON.parse(JSON.stringify(gamepad));
+
+
+                // A more complex way:
+                // Use the spread operator to make a shallow copy of gamepad.
+                let result = {...gamepad};
+                // gamepad contains two arrays. Copy them with their own spread operators.
+                result.axes = [ ...gamepad.axes ];
+                result.buttons = [];
+
+				for (let index = 0; index < gamepad.buttons.length; index++) {
+					var button_copy = {};
+					button_copy.pressed = gamepad.buttons[index].pressed;
+					button_copy.touched = gamepad.buttons[index].touched;
+					button_copy.value = gamepad.buttons[index].value;
+
+					result.buttons.push( button_copy );
+				}
+                return result;
+			
+			}
+
+			function handleController( controller ) {
+
+				var userData = controller.userData;
+				var painter = userData.painter;
+				var XRInputSource = userData.XRInputSource;
+                // Get last frame's gamepad for this controller.
+                let previous_gamepad = userData.previous_gamepad; // will be undefined for the very first frame.
+
+                if( XRInputSource !== undefined && XRInputSource.gamepad !== undefined ) {
+                    // Clone the current gamepad for the next time handleController( controller ) is called.
+                    // WARNING: Don't access userData.previous_gamepad in this function, because we've
+                    //          already updated it to the current values. Instead, use the local variable
+                    //          `previous_gamePad` created a few lines up.
+                    userData.previous_gamepad = clone_gamepad( XRInputSource.gamepad );
+                    // On the very first frame, nothing counts as "just pressed".
+                    if ( previous_gamepad === undefined ) previous_gamepad = userData.previous_gamepad;
+                }
+
+
+				// If I do console.log(XRInputSource), it is undefined at the begining. 		
+				// that's why check the existence of it
+				// https://www.w3.org/TR/webxr-gamepads-module-1/
+				if ( XRInputSource && XRInputSource.handedness === "left") {
+					// The labels exist once the font has loaded.
+					if (undo_text_mesh !== undefined && controller.getObjectByName('undo') === undefined ) {
+						controller.add( undo_text_mesh );
+
+						// attach to buttons[1]
+						undo_text_mesh.position.set(0.02, -0.02, 0.06);
+						undo_text_mesh.geometry.rotateY(Math.PI/2);
+						undo_text_mesh.geometry.rotateX(-Math.PI/6);
+					}
+					if ( save_text_mesh !== undefined && controller.getObjectByName( 'save' ) === undefined ) {
+						controller.add( save_text_mesh );
+					}
+					left_controller = controller;
+
+
+					// send undo (grip)
+					if (XRInputSource.gamepad.buttons[1].pressed && !previous_gamepad.buttons[1].pressed ) {
+						undo();
+					}
+
+					// save the sketch (X)
+					if ( XRInputSource.gamepad.buttons[4] && XRInputSource.gamepad.buttons[4].pressed && !previous_gamepad.buttons[4].pressed ) {
+						save_sketch();
+					}
+
+				}
+
+
+				if (XRInputSource && XRInputSource.handedness === "right" ) {
+
+					// switch draw mode
+					if (!freehand && XRInputSource.gamepad.buttons[4].pressed  && !previous_gamepad.buttons[4].pressed ) {
+
+						if (draw_descriptive_mode === false) {
+							// add the descriptive_mode_indicator to right controller
+							controller.add( descriptive_mode_indicator );
+							draw_descriptive_mode = true;
+						} else {
+							controller.remove( descriptive_mode_indicator );		
+							draw_descriptive_mode = false;
+						}
+					}
+
+					if (XRInputSource.gamepad.buttons[5].pressed && !previous_gamepad.buttons[5].pressed ) {
+						
+						// show/hide scaffold
+						if (show_scaffold === true) {
+							show_scaffold = false;
+							stroke_group_visible( scaffold_strokes, false );
+						} else {
+							show_scaffold = true;
+							stroke_group_visible( scaffold_strokes, true );
+
+						}
+					}
+
+				}
+				
+
+				var pivot = controller.getObjectByName( 'pivot' );
+
+				if ( userData.isSqueezing === true ) {
+
+					var delta = ( controller.position.y - userData.positionAtSqueezeStart ) * 5;
+					var scale = Math.max( 0.1, userData.scaleAtSqueezeStart + delta );
+
+					pivot.scale.setScalar( scale );
+					painter.setSize( scale );
+				}
+
+				cursor.setFromMatrixPosition( pivot.matrixWorld );
+
+
+
+				if ( userData.isSelecting === true ) {
+
+					painter.lineTo( cursor );
+					painter.update();
+
+					userData.active_stroke.push( cursor.clone() );
+				} else {
+
+					painter.moveTo( cursor );
+				}
+
+
+			}
+
+			function animate() {
+
+				renderer.setAnimationLoop( render );
+
+			}
+
+			function render() {
+
+				handleController( controller1 );
+				handleController( controller2 );
+
+				renderer.render( scene, camera );
+
+			}
+
+
+
+
+			
+		</script>
+	</body>
+</html>
