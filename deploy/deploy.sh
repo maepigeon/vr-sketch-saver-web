@@ -221,6 +221,7 @@ if systemctl is-active -q apache2 2>/dev/null; then
 # Enabled with a2enconf, so it applies to every site on this server.
 
 RedirectMatch 301 ^$APP_PATH\$ $APP_PATH/
+RedirectMatch 301 ^$UPLOAD_URL_PATH\$ $UPLOAD_URL_PATH/
 
 # The sketch websocket, then the VR page and its scripts.
 ProxyPass $APP_PATH/ws ws://127.0.0.1:$WS_PORT/
@@ -266,6 +267,7 @@ cat > "$NGINX_SNIPPET" <<EOF
 # Included from the HTTPS server block for $DOMAIN.
 
 location = $APP_PATH { return 301 $APP_PATH/; }
+location = $UPLOAD_URL_PATH { return 301 $UPLOAD_URL_PATH/; }
 
 # The sketch websocket.
 location = $APP_PATH/ws {
