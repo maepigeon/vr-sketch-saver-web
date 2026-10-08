@@ -103,10 +103,11 @@ def unique_export_path( export_dir ):
 
 
 def client_address( websocket ):
-    '''The page's address, or the one nginx passes on in X-Real-IP.'''
+    '''The page's address, or the one the web server in front passes on (X-Real-IP from nginx, X-Forwarded-For from Apache).'''
     request = getattr( websocket, 'request', None )
     headers = request.headers if request is not None else getattr( websocket, 'request_headers', {} )
-    forwarded = headers.get( 'X-Real-IP' )
+    ## The last X-Forwarded-For entry is the one added by the web server; earlier ones come from the client.
+    forwarded = headers.get( 'X-Real-IP' ) or headers.get( 'X-Forwarded-For', '' ).split( ',' )[-1].strip()
     if forwarded:
         return forwarded
     return '%s:%s' % websocket.remote_address[:2] if websocket.remote_address else '?'

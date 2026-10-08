@@ -154,7 +154,7 @@ This lets you open the sketcher from the headset's browser at `https://maepigeon
 computer or cable. Pressing **X** uploads the sketch to a public folder on the site, but only after you've
 entered your passcode on the page. Without the passcode, anyone can draw, but nothing gets saved.
 
-**First time**, on the droplet (Ubuntu with nginx and HTTPS; the headset only allows VR over HTTPS):
+**First time**, on the droplet (Ubuntu with Apache or nginx and HTTPS; the headset only allows VR over HTTPS):
 
 ```bash
 git clone https://github.com/maepigeon/vr-sketch-saver-web && cd vr-sketch-saver-web && sudo deploy/deploy.sh
@@ -173,8 +173,13 @@ The script asks for:
 
 It installs the app in `/opt/vr-sketch-saver` (with vrscaffolding and a Python venv), writes the config file
 (readable only by root and the server), runs the server as a systemd service (`vr-sketch-saver`), and writes
-the nginx settings to `/etc/nginx/snippets/vr-sketch-saver.conf`. The first time, it tells you the one line
-to add to your site's nginx config (`include snippets/vr-sketch-saver.conf;`) and in which file.
+the web server settings for the VR page and the uploads folder:
+
+- **Apache:** to `/etc/apache2/conf-available/vr-sketch-saver.conf`, turned on with `a2enconf` (so the paths
+  work on every site on the server), plus the proxy modules it needs. It checks the config before reloading
+  Apache and turns it back off if Apache rejects it, so your site keeps working.
+- **nginx:** to `/etc/nginx/snippets/vr-sketch-saver.conf`. The first time, it tells you the one line to add
+  to your site's nginx config (`include snippets/vr-sketch-saver.conf;`) and in which file.
 
 **Updating:** pull and re-run. Pressing Enter keeps each previous answer, including the passcode; `--yes` skips
 the questions:

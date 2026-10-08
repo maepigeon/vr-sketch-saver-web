@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs or updates the VR sketcher on this server (Ubuntu/Debian with nginx).
+# Installs or updates the VR sketcher on this server (Ubuntu/Debian with Apache or nginx).
 # From a checkout of this repo on the server:
 #
 #     git pull && sudo deploy/deploy.sh
@@ -19,6 +19,7 @@ PREFIX=/opt/vr-sketch-saver
 SERVICE=vr-sketch-saver
 SERVICE_USER=vrsketch
 NGINX_SNIPPET=/etc/nginx/snippets/vr-sketch-saver.conf
+APACHE_CONF=/etc/apache2/conf-available/vr-sketch-saver.conf
 VRSCAFFOLDING_REPO=https://github.com/yig/vrscaffolding
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
@@ -210,9 +211,50 @@ if ! systemctl is-active -q "$SERVICE"; then
     exit 1
 fi
 
+## Whichever web server serves the site sends the VR page, its websocket and the
+## uploads folder on to the right place.
+if systemctl is-active -q apache2 2>/dev/null; then
+    echo "== Apache"
+    a2enmod -q proxy proxy_http proxy_wstunnel headers alias >/dev/null
+    cat > "$APACHE_CONF" <<EOF
+# VR sketcher. Written by deploy/deploy.sh; re-running it overwrites this file.
+# Enabled with a2enconf, so it applies to every site on this server.
+
+RedirectMatch 301 ^$APP_PATH\$ $APP_PATH/
+
+# The sketch websocket, then the VR page and its scripts.
+ProxyPass $APP_PATH/ws ws://127.0.0.1:$WS_PORT/
+ProxyPass $APP_PATH/ http://127.0.0.1:$HTTP_PORT/
+ProxyPassReverse $APP_PATH/ http://127.0.0.1:$HTTP_PORT/
+
+# Uploaded sketches: public, listed, and readable as text from other sites.
+Alias $UPLOAD_URL_PATH/ $UPLOAD_DIR/
+<Directory $UPLOAD_DIR>
+    Options +Indexes -ExecCGI
+    AllowOverride None
+    Require all granted
+    <FilesMatch "\.obj\$">
+        ForceType text/plain
+    </FilesMatch>
+    Header set Access-Control-Allow-Origin "*"
+</Directory>
+EOF
+    a2enconf -q "$(basename "$APACHE_CONF" .conf)" >/dev/null
+    if ! apache2ctl configtest; then
+        a2disconf -q "$(basename "$APACHE_CONF" .conf)" >/dev/null
+        echo "Apache rejected $APACHE_CONF (see above), so it was turned off again and the site is unchanged." >&2
+        exit 1
+    fi
+    systemctl reload apache2
+    echo
+    echo "Done. In the headset's browser, open: https://$DOMAIN$APP_PATH/"
+    echo "Uploads appear at: $PUBLIC_URL"
+    exit 0
+fi
+
 echo "== nginx"
 if ! command -v nginx >/dev/null; then
-    echo "nginx isn't installed. Put the server behind HTTPS (the headset needs it for VR) and send"
+    echo "Neither Apache nor nginx is running. Put the server behind HTTPS (the headset needs it for VR) and send"
     echo "  https://$DOMAIN$APP_PATH/    to http://127.0.0.1:$HTTP_PORT/"
     echo "  https://$DOMAIN$APP_PATH/ws  to ws://127.0.0.1:$WS_PORT (websocket)"
     echo "  https://$DOMAIN$UPLOAD_URL_PATH/  to the folder $UPLOAD_DIR"
