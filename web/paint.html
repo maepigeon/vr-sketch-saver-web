@@ -13,6 +13,13 @@
 			Drawing with Scaffolds
 			<div id="duration"></div>
 			<div id="status"></div>
+			<!-- Shown when the server has an upload passcode (sketch_server.py --config). -->
+			<form id="unlock" hidden>
+				<input id="passcode" type="password" placeholder="upload passcode" autocomplete="current-password">
+				<button type="submit">Unlock uploads</button>
+				<label><input id="remember" type="checkbox"> remember on this device</label>
+			</form>
+			<div id="unlocked" hidden>Uploads unlocked: press X in VR to upload the sketch.</div>
 		</div>
 
 		<script src="./js/HelioWebXRPolyfill.js"></script>
@@ -56,6 +63,11 @@
 			let status_text_timeout;
 			let font;
 			let left_controller;
+
+			// Uploading with a passcode (sketch_server.py --config).
+			const PASSCODE_KEY = "vr-sketch-saver-passcode";
+			let passcode_required = false;
+			let passcode_sent;
 
 			// Everything drawn, newest last, for undo.
 			// Each entry is a list of [ group, object ] pairs.
@@ -286,9 +298,16 @@
 					save_text_mesh.name = 'save';
 				} );
 
+				document.getElementById( 'unlock' ).addEventListener( 'submit', function( event ) {
+					event.preventDefault();
+					const passcode = document.getElementById( 'passcode' ).value;
+					if ( passcode ) send_unlock( passcode );
+				} );
+
 				// Keyboard shortcuts for trying the page on a computer.
 				window.addEventListener( 'keydown', function( event ) {
 					if ( !( event.ctrlKey || event.metaKey ) ) return;
+					if ( event.target.tagName === 'INPUT' ) return;
 					if ( event.key === 'z' ) { event.preventDefault(); undo(); }
 					if ( event.key === 's' ) { event.preventDefault(); save_sketch(); }
 				} );
@@ -302,15 +321,11 @@
                 // Write a websockets server using: http://websockets.readthedocs.io/en/stable/intro.html
                 socket = new WebSocketClient;
                 
-                // Socket from URL in modern JavaScript: https://stackoverflow.com/questions/979975/how-to-get-the-value-from-the-get-parameters
-                var url = new URL( window.location.href );
-                var port = 9001; // the Quest 3 refuses `adb reverse` on 9000
-                if( url.searchParams.has("port") ) {
-                    port = parseInt( url.searchParams.get("port") );
-                }
-                
-                await socket.connect('ws://localhost:' + port);
-                console.log( "Connected on port " + port + ": ", socket.connected );
+                const ws_url = websocket_url();
+                await socket.connect( ws_url );
+                console.log( "Connected to " + ws_url + ": ", socket.connected );
+                // Asks whether saving needs the passcode.
+                socket.send( "hello" );
 
              	// The time in seconds since some arbitrary point in time.
 			 	function now() {
@@ -394,7 +409,30 @@
 						show_status( "nothing to undo" );
 					}
 					else if( cmd == "saved" ) {
-						show_status( "saved " + payload.strokes + " strokes\n" + payload.file, 6 );
+						if ( payload.url ) {
+							show_status( "uploaded " + payload.strokes + " strokes\n" + payload.file, 6, "uploaded " + payload.strokes + " strokes to " + payload.url );
+						} else {
+							show_status( "saved " + payload.strokes + " strokes\n" + payload.file, 6 );
+						}
+					}
+					else if( cmd == "hello" ) {
+						passcode_required = payload.passcode_required;
+						document.getElementById( 'unlock' ).hidden = !passcode_required;
+						const remembered = passcode_required && load_passcode();
+						if ( remembered ) send_unlock( remembered );
+					}
+					else if( cmd == "unlocked" ) {
+						if ( document.getElementById( 'remember' ).checked ) store_passcode( passcode_sent );
+						document.getElementById( 'passcode' ).value = '';
+						document.getElementById( 'unlock' ).hidden = true;
+						document.getElementById( 'unlocked' ).hidden = false;
+						show_status( "uploads unlocked" );
+					}
+					else if( cmd == "unlock-failed" ) {
+						store_passcode( null );
+						document.getElementById( 'unlock' ).hidden = false;
+						document.getElementById( 'unlocked' ).hidden = true;
+						show_status( "not unlocked:\n" + payload.message, 6 );
 					}
 					else if( cmd == "save-failed" ) {
 						show_status( "not saved:\n" + payload.message, 6 );
@@ -435,6 +473,44 @@
    
             }
 
+			// paint.html?ws=... sets the websocket address. Otherwise, from localhost (the
+			// computer, or the headset over `adb reverse`) it is sketch_server.py's own port,
+			// and on a website it is "ws" next to this page (e.g. wss://maepigeon.com/vr-sketch/ws).
+			function websocket_url() {
+				const url = new URL( window.location.href );
+				if ( url.searchParams.has( "ws" ) ) return url.searchParams.get( "ws" );
+				if ( url.searchParams.has( "port" ) || [ "localhost", "127.0.0.1", "[::1]" ].includes( url.hostname ) ) {
+					// The Quest 3 refuses `adb reverse` on 9000, so the default is 9001.
+					return "ws://localhost:" + parseInt( url.searchParams.get( "port" ) || "9001" );
+				}
+				const ws = new URL( "ws", url );
+				ws.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+				ws.search = "";
+				ws.hash = "";
+				return ws.href;
+			}
+
+			function send_unlock( passcode ) {
+				if ( !( socket && socket.connected ) ) {
+					show_status( "not unlocked:\nno connection to the sketch server" );
+					return;
+				}
+				passcode_sent = passcode;
+				socket.send( "unlock " + passcode );
+			}
+
+			// Browser storage can be unavailable (private windows, blocked site data).
+			function load_passcode() {
+				try { return localStorage.getItem( PASSCODE_KEY ); } catch ( e ) { return null; }
+			}
+
+			function store_passcode( passcode ) {
+				try {
+					if ( passcode ) localStorage.setItem( PASSCODE_KEY, passcode );
+					else localStorage.removeItem( PASSCODE_KEY );
+				} catch ( e ) {}
+			}
+
 			function onWindowResize() {
 
 				camera.aspect = window.innerWidth / window.innerHeight;
@@ -453,7 +529,7 @@
 				if ( !points.some( p => !p.equals( points[ 0 ] ) ) ) return;
 
 				if ( !( socket && socket.connected ) ) {
-					show_status( "no connection to sketch_server.py:\nthis stroke won't be saved" );
+					show_status( "no connection to the sketch server:\nthis stroke won't be saved" );
 					return;
 				}
 
@@ -479,7 +555,7 @@
 				if ( socket && socket.connected ) {
 					socket.send( "save-sketch" );
 				} else {
-					show_status( "not saved:\nno connection to sketch_server.py" );
+					show_status( "not saved:\nno connection to the sketch server" );
 				}
 			}
 
@@ -497,8 +573,8 @@
 			}
 
 			// Shows a short message above the left controller (and on the page) for a few seconds.
-			function show_status( text, seconds = 3 ) {
-				document.getElementById( 'status' ).textContent = text.replace( /\n/g, ' ' );
+			function show_status( text, seconds = 3, page_text = text ) {
+				document.getElementById( 'status' ).textContent = page_text.replace( /\n/g, ' ' );
 				clear_status_mesh();
 				clearTimeout( status_text_timeout );
 

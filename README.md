@@ -148,6 +148,59 @@ Press Ctrl+C in Terminal 1. **The sketch lives only in the running server**, so 
 
 ---
 
+## Hosting it on your website (e.g. a DigitalOcean droplet)
+
+This lets you open the sketcher from the headset's browser at `https://maepigeon.com/vr-sketch/`, with no
+computer or cable. Pressing **X** uploads the sketch to a public folder on the site, but only after you've
+entered your passcode on the page. Without the passcode, anyone can draw, but nothing gets saved.
+
+**First time**, on the droplet (Ubuntu with nginx and HTTPS; the headset only allows VR over HTTPS):
+
+```bash
+git clone https://github.com/maepigeon/vr-sketch-saver-web && cd vr-sketch-saver-web && sudo deploy/deploy.sh
+```
+
+The script asks for:
+
+| Question | Default |
+| --- | --- |
+| Website domain | `maepigeon.com` |
+| URL path of the VR page | `/vr-sketch` |
+| Private config file (holds the passcode) | `/etc/vr-sketch-saver/config.ini` |
+| Folder on the server that sketches upload to | `/var/www/maepigeon.com/sketches` |
+| URL path where that folder is public | `/sketches` |
+| Upload passcode (typed twice, hidden) | none (at least 8 characters) |
+
+It installs the app in `/opt/vr-sketch-saver` (with vrscaffolding and a Python venv), writes the config file
+(readable only by root and the server), runs the server as a systemd service (`vr-sketch-saver`), and writes
+the nginx settings to `/etc/nginx/snippets/vr-sketch-saver.conf`. The first time, it tells you the one line
+to add to your site's nginx config (`include snippets/vr-sketch-saver.conf;`) and in which file.
+
+**Updating:** pull and re-run. Pressing Enter keeps each previous answer, including the passcode; `--yes` skips
+the questions:
+
+```bash
+cd vr-sketch-saver-web && git pull && sudo deploy/deploy.sh --yes
+```
+
+**In the headset:** open `https://maepigeon.com/vr-sketch/`, type the passcode in the box at the top and press
+**Unlock uploads** (tick "remember on this device" to skip this next time), then **Enter VR**. **X** now
+uploads, and the message above the left controller shows the file name. Uploads are listed at
+`https://maepigeon.com/sketches/`. If you forgot to unlock, X says "Uploads are locked": leave VR (the sketch
+stays), unlock, and go back in.
+
+To change the passcode or folder, re-run `sudo deploy/deploy.sh`, or edit the config file directly: the server
+re-reads it on every unlock and save. Logs: `sudo journalctl -u vr-sketch-saver -f`.
+
+Wrong passcodes wait 2 seconds each, a page is disconnected after 5, and unlocking pauses for everyone after 20
+wrong tries in 15 minutes. With a passcode set, the server also refuses the `get-sketch` request that
+`export_sketch.py` uses, so nobody can download other people's sketches.
+
+To try the passcode mode on your computer: `python3 sketch_server.py --config my-config.ini` (see
+`deploy/config.example.ini`).
+
+---
+
 ## Good to know
 
 - **Starting a new sketch:** reload `paint.html`. The page and a new session both start empty. Until you draw in
@@ -182,7 +235,10 @@ written exactly like `sketch.obj` (the test checks that re-writing `sketch.obj` 
 - `export_sketch.py`: the export command.
 - `sketch_export.py`: export options shared by the command and the X button.
 - `obj_polylines.py`: OBJ polyline writer and reader, plus resampling.
-- `test_export.py`: end-to-end test of the server, undo, save, and export.
+- `upload_config.py`: reads the private config file (passcode, upload folder) used on a website.
+- `deploy/deploy.sh`: installs or updates the server on a website (see "Hosting it on your website").
+- `requirements.txt`: the Python packages.
+- `test_export.py`: end-to-end test of the server, undo, save, export, and passcode uploads.
 - `exports/`: where the X button saves (created on the first save).
 
 ## Changes to vrscaffolding

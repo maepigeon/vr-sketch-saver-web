@@ -25,6 +25,7 @@ from obj_polylines import polylines_to_obj, read_obj
 
 HERE = Path( __file__ ).resolve().parent
 TMP = Path( tempfile.mkdtemp( prefix = 'vr-sketch-saver-test-' ) )
+PASSCODE = 'correct horse battery'
 
 ## A 40cm square at table height.
 CORNERS = np.array( [ [ -.2, 1.2, -.2 ], [ .2, 1.2, -.2 ], [ .2, 1.2, .2 ], [ -.2, 1.2, .2 ] ] )
@@ -130,6 +131,33 @@ async def draw_freehand( port ):
     return [ curves[0], curves[2] ]
 
 
+async def upload( port, upload_dir ):
+    '''With --config: saving needs the passcode and goes to the configured folder.'''
+    curves = [ stroke( CORNERS[0], CORNERS[2] ), stroke( CORNERS[1], CORNERS[3] ) ]
+    async with websockets.connect( 'ws://localhost:%d' % port ) as ws:
+        assert await command( ws, 'hello' ) == ( 'hello', { 'passcode_required': True } )
+        for c in curves:
+            await ws.send( 'freehand-stroke ' + as_vector3_json( c ) )
+        kind, payload = await command( ws, 'save-sketch' )
+        assert kind == 'save-failed' and 'locked' in payload['message'], ( kind, payload )
+        await ws.send( 'get-sketch' )
+        assert ( await ws.recv() ).startswith( 'error ' )
+
+        assert ( await command( ws, 'unlock not-the-passcode' ) )[0] == 'unlock-failed'
+        assert await command( ws, 'unlock ' + PASSCODE ) == ( 'unlocked', { 'public_url': 'https://example.com/sketches/' } )
+        kind, payload = await command( ws, 'save-sketch' )
+        assert kind == 'saved' and payload['strokes'] == 2, ( kind, payload )
+        assert payload['url'] == 'https://example.com/sketches/' + payload['file']
+        assert len( read_obj( upload_dir / payload['file'] ) ) == 2
+        await ws.send( 'get-sketch' )
+        assert ( await ws.recv() ).startswith( 'sketch ' )
+
+    ## A page that never unlocks can't save.
+    async with websockets.connect( 'ws://localhost:%d' % port ) as ws:
+        await ws.send( 'freehand-stroke ' + as_vector3_json( curves[0] ) )
+        assert ( await command( ws, 'save-sketch' ) )[0] == 'save-failed'
+
+
 def export( port, *args ):
     out = TMP / ( 'export-%d.obj' % len( list( TMP.glob( 'export-*.obj' ) ) ) )
     subprocess.run( [ sys.executable, str( HERE / 'export_sketch.py' ), str( out ), '--port', str( port ), *args ],
@@ -196,6 +224,22 @@ def main():
         assert len( exact ) == 2 and all( np.allclose( a, b ) for a, b in zip( exact, drawn ) )
         check_fit( export( port ) )
         assert len( list( export_dir.glob( '*.obj' ) ) ) == 2
+    finally:
+        server.terminate()
+        server.wait()
+
+    ## The same server as deployed on a website, with a private config file.
+    upload_dir = TMP / 'public' / 'sketches'
+    config = TMP / 'config.ini'
+    config.write_text( '[upload]\npasscode = %s\nupload_dir = %s\npublic_url = https://example.com/sketches\n' % ( PASSCODE, upload_dir ) )
+    port = free_port()
+    server = subprocess.Popen( [ sys.executable, str( HERE / 'sketch_server.py' ), '--port', str( port ),
+                                 '--http-port', '0', '--config', str( config ) ],
+                               stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL )
+    try:
+        wait_for_port( port )
+        asyncio.run( upload( port, upload_dir ) )
+        assert len( list( upload_dir.glob( '*.obj' ) ) ) == 1
     finally:
         server.terminate()
         server.wait()

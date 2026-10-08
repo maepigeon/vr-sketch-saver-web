@@ -1,0 +1,4 @@
+# vrscaffolding's line fitting uses a function NumPy 2 removed.
+numpy<2
+scipy
+websockets==13.1

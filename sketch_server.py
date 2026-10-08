@@ -12,12 +12,17 @@ Runs the VR sketcher with saving and undo. One command does everything:
   - remembers the sketch so it can be saved from VR (left X button) or with
     `python3 export_sketch.py` at any moment
 
+With --config (for a public website, see deploy/README.md), the save button
+uploads to the folder named in that private config file instead, and only
+after the passcode in it has been entered on the page.
+
 Usage:
-    python3 sketch_server.py [--port 9001] [--http-port 8000] [--export-dir exports]
+    python3 sketch_server.py [--port 9001] [--http-port 8000] [--export-dir exports] [--config config.ini]
 '''
 
 import argparse
 import asyncio
+import collections
 import copy
 import http.server
 import json
@@ -32,9 +37,20 @@ import websockets
 
 from obj_polylines import write_obj
 from sketch_export import ExportError, add_export_options, parse_export_options, sketch_polylines
+from upload_config import ConfigError, load_upload_config, passcode_matches
 
 HERE = Path( __file__ ).resolve().parent
 DEFAULT_VRSCAFFOLDING = HERE.parent / 'vrscaffolding' / 'threejs'
+
+## Largest message accepted from a page; a long stroke is well under 1 MB.
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+
+## Wrong passcodes: each one waits before replying, a connection is closed after
+## a few, and after too many from anyone recently, all unlocking pauses.
+WRONG_PASSCODE_DELAY = 2
+WRONG_PASSCODES_PER_CONNECTION = 5
+WRONG_PASSCODES_PER_WINDOW = 20
+WRONG_PASSCODE_WINDOW = 15 * 60
 
 
 class SketchSession:
@@ -86,7 +102,22 @@ def unique_export_path( export_dir ):
     return path
 
 
-def make_handler( scaffold_sketch, sessions, export_dir, export_options ):
+def client_address( websocket ):
+    '''The page's address, or the one nginx passes on in X-Real-IP.'''
+    request = getattr( websocket, 'request', None )
+    headers = request.headers if request is not None else getattr( websocket, 'request_headers', {} )
+    forwarded = headers.get( 'X-Real-IP' )
+    if forwarded:
+        return forwarded
+    return '%s:%s' % websocket.remote_address[:2] if websocket.remote_address else '?'
+
+
+def make_handler( scaffold_sketch, sessions, export_dir, export_options, upload_config_path = None ):
+    '''
+    Without `upload_config_path`, the save button writes to `export_dir`.
+    With it, saving needs the passcode from that file and writes to its upload_dir.
+    '''
+    wrong_passcode_times = collections.deque()
 
     def latest_session():
         drawn = [ s for s in sessions if s.last_stroke is not None ]
@@ -151,19 +182,64 @@ def make_handler( scaffold_sketch, sessions, export_dir, export_options ):
         print( 'Undid a %s stroke.' % { 'shapes': 'shape', 'scaffold': 'scaffold', 'raw': 'freehand' }[ stroke['layer'] ] )
         log_counts( session )
 
-    async def handle_save( websocket, session ):
+    async def handle_unlock( websocket, remote, attempt ):
+        '''Returns True if `attempt` is the passcode.'''
+        def reply( message ):
+            return websocket.send( 'unlock-failed ' + json.dumps( { 'message': message } ) )
+
+        if upload_config_path is None:
+            await reply( 'This server saves without a passcode.' )
+            return False
         try:
+            config = load_upload_config( upload_config_path )
+        except ConfigError as e:
+            print( 'Unlock from %s failed: %s' % ( remote, e ), file = sys.stderr )
+            await reply( 'Uploads are not set up on the server.' )
+            return False
+
+        now = time.time()
+        while wrong_passcode_times and wrong_passcode_times[0] < now - WRONG_PASSCODE_WINDOW:
+            wrong_passcode_times.popleft()
+        if len( wrong_passcode_times ) >= WRONG_PASSCODES_PER_WINDOW:
+            print( 'Unlock from %s refused: too many wrong passcodes recently.' % remote, file = sys.stderr )
+            await reply( 'Too many wrong passcodes. Try again in a few minutes.' )
+            return False
+
+        if passcode_matches( config, attempt ):
+            print( 'Uploads unlocked for', remote )
+            await websocket.send( 'unlocked ' + json.dumps( { 'public_url': config['public_url'] } ) )
+            return True
+
+        wrong_passcode_times.append( now )
+        print( 'Wrong passcode from', remote, file = sys.stderr )
+        await asyncio.sleep( WRONG_PASSCODE_DELAY )
+        await reply( 'Wrong passcode.' )
+        return False
+
+    async def handle_save( websocket, session, unlocked ):
+        try:
+            if upload_config_path is not None and not unlocked:
+                raise ExportError( 'Uploads are locked. Enter the passcode on the page first.' )
             if session is None:
                 raise ExportError( 'Nothing has been drawn yet.' )
             polylines = sketch_polylines( session.sketch(), **export_options )
-        except ExportError as e:
+
+            public_url = None
+            directory = export_dir
+            if upload_config_path is not None:
+                config = load_upload_config( upload_config_path )
+                directory, public_url = config['upload_dir'], config['public_url']
+            path = unique_export_path( directory )
+            write_obj( path, polylines )
+        except ( ExportError, ConfigError, OSError ) as e:
             print( 'Save from VR failed:', e )
             await websocket.send( 'save-failed ' + json.dumps( { 'message': str( e ) } ) )
             return
-        path = unique_export_path( export_dir )
-        write_obj( path, polylines )
         print( 'Saved %d strokes to %s' % ( len( polylines ), path ) )
-        await websocket.send( 'saved ' + json.dumps( { 'file': path.name, 'strokes': len( polylines ) } ) )
+        reply = { 'file': path.name, 'strokes': len( polylines ) }
+        if public_url:
+            reply['url'] = public_url + path.name
+        await websocket.send( 'saved ' + json.dumps( reply ) )
 
     async def handle_get_sketch( websocket ):
         session = latest_session()
@@ -173,9 +249,11 @@ def make_handler( scaffold_sketch, sessions, export_dir, export_options ):
         await websocket.send( 'sketch ' + json.dumps( session.sketch() ) )
 
     async def handler( websocket, path = None ):
-        remote = '%s:%s' % websocket.remote_address[:2] if websocket.remote_address else '?'
+        remote = client_address( websocket )
         ## Created on the first stroke, so export requests don't count as sessions.
         session = None
+        unlocked = False
+        wrong_passcodes = 0
         try:
             async for message in websocket:
                 parsed = message.split( ' ', 1 )
@@ -194,15 +272,30 @@ def make_handler( scaffold_sketch, sessions, export_dir, export_options ):
                 elif command == 'undo':
                     await handle_undo( websocket, session )
                 elif command == 'save-sketch':
-                    await handle_save( websocket, session )
+                    await handle_save( websocket, session, unlocked )
+                elif command == 'hello':
+                    await websocket.send( 'hello ' + json.dumps( { 'passcode_required': upload_config_path is not None } ) )
+                elif command == 'unlock':
+                    unlocked = await handle_unlock( websocket, remote, parameters or '' )
+                    if not unlocked:
+                        wrong_passcodes += 1
+                        if wrong_passcodes >= WRONG_PASSCODES_PER_CONNECTION:
+                            break
                 elif command == 'get-sketch':
-                    await handle_get_sketch( websocket )
+                    ## On a public server, other people's sketches stay private.
+                    if upload_config_path is not None and not unlocked:
+                        await websocket.send( 'error Exporting needs the passcode on this server.' )
+                    else:
+                        await handle_get_sketch( websocket )
                 else:
                     print( 'Unknown command:', command, file = sys.stderr )
         finally:
             if session is not None:
                 session.connected = False
                 print( 'Drawing session from %s disconnected; it can still be exported until another session draws.' % remote )
+                ## Only the latest sketch can be exported once its page is gone, so forget the others.
+                latest = latest_session()
+                sessions[:] = [ s for s in sessions if s.connected or s is latest ]
 
     return handler
 
@@ -225,9 +318,11 @@ class LayeredRequestHandler( http.server.SimpleHTTPRequestHandler ):
         return candidate
 
     def do_GET( self ):
-        if self.path in ( '/', '/index.html' ):
+        path, _, query = self.path.partition( '?' )
+        if path in ( '/', '/index.html' ):
             self.send_response( 302 )
-            self.send_header( 'Location', '/paint.html' )
+            ## Relative, so it also works under a path such as maepigeon.com/vr-sketch/.
+            self.send_header( 'Location', 'paint.html' + ( '?' + query if query else '' ) )
             self.end_headers()
             return
         super().do_GET()
@@ -265,7 +360,7 @@ def load_scaffold_sketch( vrscaffolding ):
 
 async def serve( host, port, handler ):
     try:
-        server = await websockets.serve( handler, host, port, max_size = None )
+        server = await websockets.serve( handler, host, port, max_size = MAX_MESSAGE_BYTES )
     except OSError as e:
         sys.exit( 'Could not listen on port %d (%s). Is ping.py or another sketch_server.py still running?' % ( port, e ) )
     async with server:
@@ -281,6 +376,9 @@ def main():
         help = 'path to vrscaffolding/threejs (default: %(default)s)' )
     parser.add_argument( '--export-dir', default = HERE / 'exports',
         help = 'where the save button in VR writes OBJ files (default: %(default)s)' )
+    parser.add_argument( '--config', default = os.environ.get( 'VR_SKETCH_CONFIG' ),
+        help = 'private config file with the upload passcode and folder (see deploy/config.example.ini); '
+               'when given, saving from VR needs the passcode and writes to that folder instead of --export-dir' )
     group = parser.add_argument_group( 'what the save button in VR writes (same options as export_sketch.py)' )
     add_export_options( group )
     args = parser.parse_args()
@@ -290,14 +388,26 @@ def main():
     export_options = parse_export_options( parser, args )
     vrscaffolding = Path( args.vrscaffolding ).resolve()
     scaffold_sketch = load_scaffold_sketch( vrscaffolding )
-    handler = make_handler( scaffold_sketch, [], Path( args.export_dir ).resolve(), export_options )
+    config_path = Path( args.config ).resolve() if args.config else None
+    if config_path is not None:
+        ## Catch mistakes now rather than on the first save from VR.
+        try:
+            upload_config = load_upload_config( config_path )
+        except ConfigError as e:
+            sys.exit( e )
+    handler = make_handler( scaffold_sketch, [], Path( args.export_dir ).resolve(), export_options, config_path )
 
     if args.http_port:
         start_http_server( args.http_port, [ HERE / 'web', vrscaffolding ] )
         print( 'VR page:          http://localhost:%d/paint.html' % args.http_port )
     print( 'Sketch websocket: ws://%s:%d' % ( args.host, args.port ) )
-    print( 'Save from VR with the left X button (files go to %s),' % Path( args.export_dir ).resolve() )
-    print( 'or from here with: python3 export_sketch.py my_sketch.obj' )
+    if config_path is None:
+        print( 'Save from VR with the left X button (files go to %s),' % Path( args.export_dir ).resolve() )
+        print( 'or from here with: python3 export_sketch.py my_sketch.obj' )
+    else:
+        print( 'Upload from VR with the left X button after entering the passcode from %s' % config_path )
+        print( '(files go to %s%s; the config is re-read on every save).' % (
+            upload_config['upload_dir'], ', at ' + upload_config['public_url'] if upload_config['public_url'] else '' ) )
     try:
         asyncio.run( serve( args.host, args.port, handler ) )
     except KeyboardInterrupt:
